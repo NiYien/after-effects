@@ -7,6 +7,81 @@ use objc2_core_foundation::{CFRange, CFString};
 
 const MAX_NAME_LEN: usize = 32;
 
+/// Convert a UTF-8 string to the running system's ANSI code page (Windows `CP_ACP`,
+/// macOS `CFString` system encoding) and return NUL-terminated bytes. The encoded
+/// content is truncated on a whole-character boundary so it does not exceed
+/// `max_bytes` (the trailing NUL is added afterwards and is not counted toward the
+/// limit). For ASCII input on any code page this is a byte-identical copy.
+///
+/// Adobe hosts read parameter buffers in the system ANSI code page (the encoding the
+/// `PF_ParamDef.name` buffer and the button/popup name pointers expect), so localized
+/// labels must be converted here rather than handed over as raw UTF-8 — the host would
+/// otherwise misread the UTF-8 bytes as system-encoded ones and render mojibake.
+pub(crate) fn to_system_codepage(s: &str, max_bytes: usize) -> Vec<u8> {
+    // Platform primitive: encode a whole `&str` to the system code page without a
+    // trailing NUL and without truncation. Returns empty on failure / empty input.
+    #[cfg(target_os = "windows")]
+    fn encode(s: &str) -> Vec<u8> {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Globalization::{WideCharToMultiByte, CP_ACP};
+        if s.is_empty() { return Vec::new(); }
+        let wstr: Vec<u16> = OsStr::new(s).encode_wide().collect();
+        if wstr.is_empty() { return Vec::new(); }
+        unsafe {
+            let len = WideCharToMultiByte(CP_ACP, 0, wstr.as_ptr(), wstr.len() as i32, std::ptr::null_mut(), 0, std::ptr::null(), std::ptr::null_mut());
+            if len <= 0 { return Vec::new(); }
+            let mut bytes: Vec<u8> = Vec::with_capacity(len as usize);
+            let written = WideCharToMultiByte(CP_ACP, 0, wstr.as_ptr(), wstr.len() as i32, bytes.as_mut_ptr() as _, len, std::ptr::null(), std::ptr::null_mut());
+            if written <= 0 { return Vec::new(); }
+            bytes.set_len(written as usize);
+            bytes
+        }
+    }
+    #[cfg(target_os = "macos")]
+    fn encode(s: &str) -> Vec<u8> {
+        if s.is_empty() { return Vec::new(); }
+        unsafe {
+            let cfstr = CFString::from_str(s);
+            let encoding = CFString::system_encoding();
+            let length = cfstr.length();
+            let max_size = CFString::maximum_size_for_encoding(length, encoding);
+            let mut buffer = vec![0u8; max_size as usize];
+            let mut used_len = 0;
+            CFString::bytes(&cfstr, CFRange::new(0, length), encoding, b'?', false, buffer.as_mut_ptr(), max_size, &mut used_len);
+            buffer.truncate(used_len as usize);
+            buffer
+        }
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    fn encode(s: &str) -> Vec<u8> {
+        // No Adobe host param buffer on other platforms; pass UTF-8 through unchanged.
+        s.as_bytes().to_vec()
+    }
+
+    let mut content = encode(s);
+    if content.len() > max_bytes {
+        // Re-encode the longest whole-character prefix of the source that still fits,
+        // so a multi-byte (GBK / Shift-JIS / …) sequence is never split at the cut.
+        // Encoded length is monotonic in the prefix length, so stop at the first overflow.
+        let mut fit = 0usize;
+        for end in s.char_indices().map(|(i, _)| i).chain(std::iter::once(s.len())) {
+            if encode(&s[..end]).len() <= max_bytes { fit = end; } else { break; }
+        }
+        content = encode(&s[..fit]);
+    }
+    content.push(0); // NUL-terminate
+    content
+}
+
+/// Build a NUL-terminated C string in the system code page from a UTF-8 `&str`. Used by
+/// the param label / popup-option sinks, which hand the host a pointer (no fixed-length
+/// buffer), so no truncation is applied. Falls back to an empty C string rather than
+/// panicking in the (practically impossible) case of an interior NUL after conversion.
+pub(crate) fn cstring_in_system_codepage(s: &str) -> CString {
+    CString::from_vec_with_nul(to_system_codepage(s, usize::MAX)).unwrap_or_default()
+}
+
 define_enum! {
     ae_sys::PF_ParamType,
     ParamType {
@@ -189,7 +264,8 @@ impl<'a> CheckBoxDef<'_> {
         self.def.dephault != 0
     }
     pub fn set_label(&mut self, v: &str) -> &mut Self {
-        self.label = CString::new(v).unwrap();
+        // Convert to the system code page so a localized label doesn't render as mojibake.
+        self.label = cstring_in_system_codepage(v);
         self.def.u.nameptr = self.label.as_ptr();
         self
     }
@@ -413,7 +489,8 @@ define_param_wrapper! {
 impl<'a> PopupDef<'a> {
     pub fn set_options(&mut self, options: &[&str]) {
         // Build a string in the format "list|of|choices|", the format Ae expects.
-        self.options = CString::new(options.join("|")).unwrap();
+        // Convert to the system code page so localized options don't render as mojibake.
+        self.options = cstring_in_system_codepage(&options.join("|"));
         self.def.u.namesptr = self.options.as_ptr();
         self.def.num_choices = options.len().try_into().unwrap();
     }
@@ -1062,66 +1139,13 @@ impl<'p> ParamDef<'p> {
             self.param_def.name[0] = 0;
             return Ok(());
         }
-        // According to Adobe docs, the encoding expected for the name is the system encoding.
+        // The host reads `PF_ParamDef.name` in the system ANSI code page. Encode to that
+        // code page, NUL-terminated and truncated on a character boundary so the content
+        // plus the trailing NUL fits the MAX_NAME_LEN-byte buffer.
         // Reference: https://ae-plugins.docsforadobe.dev/intro/localization/
-        let mut bytes = {
-            #[cfg(target_os = "macos")]
-            unsafe {
-                let cfstr = CFString::from_str(name);
-                let encoding = CFString::system_encoding(); 
-                let length = cfstr.length();
-                let max_size = CFString::maximum_size_for_encoding(length, encoding);
-                
-                let mut buffer = vec![0u8; max_size as usize];
-                let mut used_len = 0;
-                
-                 CFString::bytes(
-                    &cfstr,
-                    CFRange::new(0, length),
-                    encoding,
-                    b'?',  // replacement for unconvertible characters
-                    false,
-                    buffer.as_mut_ptr(),
-                    max_size,
-                    &mut used_len,
-                );
-                
-                buffer.truncate(used_len as usize);
-                buffer
-            }
-            #[cfg(target_os = "windows")]
-            unsafe {
-                use std::ffi::OsStr;
-                use std::os::windows::ffi::OsStrExt;
-                use windows_sys::Win32::Globalization::{WideCharToMultiByte, CP_OEMCP};
-                let mut wstr: Vec<u16> = OsStr::new(name).encode_wide().collect();
-                if !wstr.is_empty() {
-                    wstr.push(0); // Null-terminate
-                    let len = WideCharToMultiByte(CP_OEMCP, 0, wstr.as_ptr(), wstr.len() as i32, std::ptr::null_mut(), 0, std::ptr::null(), std::ptr::null_mut());
-                    if len > 0 {
-                        let mut bytes: Vec<u8> = Vec::with_capacity(len as usize);
-                        let len = WideCharToMultiByte(CP_OEMCP, 0, wstr.as_ptr(), wstr.len() as i32, bytes.as_mut_ptr() as _, len, std::ptr::null(), std::ptr::null_mut());
-                        if len > 0 {
-                            bytes.set_len(len as usize);
-                            bytes
-                        } else {
-                            Vec::new()
-                        }
-                    } else {
-                        Vec::new()
-                    }
-                } else {
-                    Vec::new()
-                }
-            }
-        };
-
-        let to_copy = bytes.len().min(MAX_NAME_LEN);
-        if to_copy > 0 {
-            bytes.resize(to_copy, 0);
-            if let Some(last_elem) = bytes.get_mut(MAX_NAME_LEN - 1) {
-                *last_elem = 0;
-            }
+        let bytes = to_system_codepage(name, MAX_NAME_LEN - 1);
+        // `bytes` is NUL-terminated; a length > 1 means there is at least one content byte.
+        if bytes.len() > 1 {
             self.param_def.name[0..bytes.len()].copy_from_slice(unsafe { std::mem::transmute(bytes.as_slice()) });
             return Ok(());
         }
@@ -1411,5 +1435,63 @@ impl<'p, P: Eq + PartialEq + Hash + Copy + Debug> Parameters<'p, P> {
             map: self.map.clone(),
             params: self.params.to_vec(),
         }
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod cjk_encoding_tests {
+    use super::to_system_codepage;
+    use windows_sys::Win32::Globalization::{GetACP, MultiByteToWideChar, CP_ACP};
+
+    // Decode system-code-page bytes back to a Rust String (reverse of `to_system_codepage`),
+    // used to assert lossless round-trips without hard-coding any code page's byte values.
+    fn from_system_codepage(bytes: &[u8]) -> String {
+        if bytes.is_empty() { return String::new(); }
+        unsafe {
+            let wlen = MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), bytes.len() as i32, std::ptr::null_mut(), 0);
+            let mut wbuf = vec![0u16; wlen as usize];
+            MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), bytes.len() as i32, wbuf.as_mut_ptr(), wlen);
+            String::from_utf16_lossy(&wbuf)
+        }
+    }
+
+    #[test]
+    fn ascii_passthrough_is_byte_identical() {
+        // ASCII is a no-op on every code page; output is the input plus a single NUL.
+        assert_eq!(to_system_codepage("Browse", usize::MAX), b"Browse\0".to_vec());
+        assert_eq!(to_system_codepage("", usize::MAX), b"\0".to_vec());
+    }
+
+    #[test]
+    fn ascii_truncation_fits_and_nul_terminates() {
+        let s = "abcdefghijklmnopqrstuvwxyzABCDEF"; // 32 ASCII chars
+        let out = to_system_codepage(s, 31);
+        assert_eq!(*out.last().unwrap(), 0, "must be NUL-terminated");
+        assert_eq!(out.len(), 32, "31 content bytes + NUL");
+        assert_eq!(&out[..31], &s.as_bytes()[..31]);
+    }
+
+    #[test]
+    fn roundtrip_recovers_cjk_on_gbk_host() {
+        if unsafe { GetACP() } != 936 { return; } // only meaningful on a GBK (CP936) host
+        let original = "打开 Gyroflow 缩放方式";
+        let acp = to_system_codepage(original, usize::MAX);
+        let recovered = from_system_codepage(&acp[..acp.len() - 1]); // drop trailing NUL
+        assert_eq!(recovered, original);
+        // The encoded form must NOT be the raw UTF-8 bytes — that mismatch was the bug.
+        assert_ne!(&acp[..acp.len() - 1], original.as_bytes());
+    }
+
+    #[test]
+    fn truncation_never_splits_a_multibyte_char_on_gbk_host() {
+        if unsafe { GetACP() } != 936 { return; }
+        // Each CJK char encodes to 2 GBK bytes. With an odd byte budget the cut must drop
+        // to the last whole character rather than leave half a multi-byte sequence.
+        let s = "稳定平滑校正"; // 6 CJK chars -> 12 GBK bytes
+        let out = to_system_codepage(s, 5); // budget 5 -> keep 2 whole chars (4 bytes)
+        let content = &out[..out.len() - 1];
+        assert_eq!(content.len() % 2, 0, "no half multi-byte char left");
+        assert_eq!(content.len(), 4);
+        assert_eq!(from_system_codepage(content), "稳定"); // decodes cleanly, no replacement char
     }
 }

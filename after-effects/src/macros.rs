@@ -333,7 +333,8 @@ macro_rules! define_param_wrapper {
     (impl String, $name:ident) => {
         paste::item! {
             pub fn [<set_ $name>](&mut self, v: &str) -> &mut Self {
-                self.$name = CString::new(v).unwrap();
+                // Convert to the system code page so a localized label doesn't render as mojibake.
+                self.$name = crate::pf::parameters::cstring_in_system_codepage(v);
                 { self.def.u.namesptr = self.$name.as_ptr(); }
                 self
             }
